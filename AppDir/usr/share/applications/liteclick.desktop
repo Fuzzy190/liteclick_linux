@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=LiteClick
+Comment=Linux Mouse and Keyboard Automation
+Exec=AppRun
+Icon=liteclick
+Type=Application
+Categories=Utility;
+Terminal=false

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LiteClick
+Comment=Keyboard and mouse automation with macro playback
+Exec=LiteClick
+Icon=liteclick
+Categories=Utility;Accessibility;
+Terminal=false
+StartupNotify=true
