@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from threading import Event, Lock
 
-from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtCore import QThread, Signal, Qt, QTimer
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFrame, QTabWidget, QComboBox, QSpinBox, QFormLayout, QTableWidget,
@@ -35,6 +35,7 @@ SPECIAL_KEYS = {
 BUTTONS = {"Left click": Button.left, "Middle click": Button.middle, "Right click": Button.right}
 PROFILE_DIR = Path.home() / ".config" / "liteclick" / "profiles"
 SETTINGS_FILE = Path.home() / ".config" / "liteclick" / "settings.json"
+DEFAULT_PLAYBACK_FILE = PROFILE_DIR / "default-playback.json"
 DEFAULT_HOTKEYS = {
     "keyboard": "F6",          # toggle keyboard automation
     "mouse": "F8",             # toggle mouse automation
@@ -233,9 +234,41 @@ class PlaybackWorker(QThread):
         self.jitter_percent = max(0, min(50, int(jitter_percent)))
         self.move_cursor = move_cursor
         self.stop_event = Event()
+        self.pause_event = Event()
+        self.pause_event.set()
 
     def stop(self):
         self.stop_event.set()
+        self.pause_event.set()
+
+    def pause(self):
+        self.pause_event.clear()
+
+    def resume(self):
+        self.pause_event.set()
+
+    @property
+    def is_paused(self):
+        return not self.pause_event.is_set()
+
+    def _wait_for_resume(self):
+        while not self.stop_event.is_set():
+            if self.pause_event.wait(0.05):
+                return True
+        return False
+
+    def _wait_active(self, duration):
+        remaining = max(0.0, duration)
+        while remaining > 0 and not self.stop_event.is_set():
+            if not self.pause_event.wait(0.05):
+                continue
+            chunk = min(remaining, 0.05)
+            began = time.monotonic()
+            if self.stop_event.wait(chunk):
+                return False
+            if self.pause_event.is_set():
+                remaining = max(0.0, remaining - (time.monotonic() - began))
+        return not self.stop_event.is_set()
 
     def run(self):
         kb, ms = KeyboardController(), MouseController()
@@ -245,14 +278,14 @@ class PlaybackWorker(QThread):
             while not self.stop_event.is_set() and (self.repeats == 0 or loops < self.repeats):
                 previous = 0.0
                 for event in self.events:
-                    if self.stop_event.is_set():
+                    if self.stop_event.is_set() or not self._wait_for_resume():
                         break
                     target = max(previous, float(event.get("t", 0)) / self.speed)
                     delay = max(0.0, target - previous)
                     if delay and self.jitter_percent:
                         spread = self.jitter_percent / 100.0
                         delay *= random.uniform(1.0 - spread, 1.0 + spread)
-                    if self.stop_event.wait(delay):
+                    if not self._wait_active(delay) or not self._wait_for_resume():
                         break
                     previous = target
                     typ = event["type"]
@@ -285,7 +318,6 @@ class PlaybackWorker(QThread):
         except Exception as exc:
             self.message.emit(f"Playback error: {exc}")
         finally:
-            # Never leave a key/button logically held if Stop is pressed mid-macro.
             for key in held_keys:
                 try: kb.release(key)
                 except Exception: pass
@@ -310,6 +342,10 @@ class MainWindow(QMainWindow):
         self.playback_worker = None
         self.recorder = Recorder(self._record_count_changed)
         self.recorded_events = []
+        self.playback_profile_name = "Unsaved recording"
+        self.countdown_dialog = None
+        self.countdown_timer = None
+        self.countdown_remaining = 0
         self._hotkey_listener = None
         self._hotkeys = dict(DEFAULT_HOTKEYS)
         self._load_settings()
@@ -343,7 +379,7 @@ class MainWindow(QMainWindow):
         titlebox.addWidget(subtitle)
         header.addLayout(titlebox)
         header.addStretch()
-        badge = QLabel("LINUX EDITION  •  v3.0")
+        badge = QLabel("LINUX EDITION  •  v7.5")
         badge.setObjectName("Badge")
         header.addWidget(badge)
         main.addLayout(header)
@@ -366,6 +402,7 @@ class MainWindow(QMainWindow):
         note.setObjectName("Subtitle")
         footer.addWidget(note)
         main.addLayout(footer)
+        self._load_default_playback_profile()
         self._start_hotkey_listener()
 
     def _panel(self, layout):
@@ -438,12 +475,13 @@ class MainWindow(QMainWindow):
         down.clicked.connect(lambda: self._move_selected(table, 1))
         actions.addWidget(up)
         actions.addWidget(down)
-        save_profile = QPushButton("Save profile…")
-        load_profile = QPushButton("Load profile…")
-        save_profile.clicked.connect(lambda: self.save_input_profile(kind))
-        load_profile.clicked.connect(lambda: self.load_input_profile(kind))
-        actions.addWidget(save_profile)
-        actions.addWidget(load_profile)
+        if kind == "key":
+            save_profile = QPushButton("Save keyboard profile…")
+            load_profile = QPushButton("Load keyboard profile…")
+            save_profile.clicked.connect(lambda: self.save_input_profile("key"))
+            load_profile.clicked.connect(lambda: self.load_input_profile("key"))
+            actions.addWidget(save_profile)
+            actions.addWidget(load_profile)
         actions.addStretch()
         panel_layout.addLayout(actions)
         layout.addWidget(self._panel(panel_layout), 1)
@@ -723,11 +761,15 @@ class MainWindow(QMainWindow):
         self.play_button = QPushButton(f"▶ Start playback  [{self._hotkeys['play_start']}]")
         self.play_button.setObjectName("StartButton")
         self.play_button.clicked.connect(self.start_playback)
+        self.pause_playback_button = QPushButton("Ⅱ Pause")
+        self.pause_playback_button.setEnabled(False)
+        self.pause_playback_button.clicked.connect(self.pause_resume_playback)
         self.stop_playback_button = QPushButton(f"■ Stop playback  [{self._hotkeys['play_stop']}]")
         self.stop_playback_button.setEnabled(False)
         self.stop_playback_button.clicked.connect(self.stop_playback)
         row.addWidget(self.record_button)
         row.addWidget(self.play_button)
+        row.addWidget(self.pause_playback_button)
         row.addWidget(self.stop_playback_button)
         panel_layout.addLayout(row)
 
@@ -753,16 +795,19 @@ class MainWindow(QMainWindow):
         load = QPushButton("Load playback profile…")
         rename_profile = QPushButton("Rename saved profile…")
         export_log = QPushButton("Export event log (.md/.txt)…")
+        set_default = QPushButton("Set as default")
         save.setToolTip("Save the recorded events together with repeat, speed, timing, and cursor settings.")
         export_log.setToolTip("Export a human-readable list of recorded events. Markdown/text logs are for viewing; use a JSON profile to replay.")
         save.clicked.connect(self.save_recording)
         load.clicked.connect(self.load_recording)
         rename_profile.clicked.connect(self.rename_playback_profile)
         export_log.clicked.connect(self.export_event_log)
+        set_default.clicked.connect(self.set_default_playback_profile)
         files.addWidget(save)
         files.addWidget(load)
         files.addWidget(rename_profile)
         files.addWidget(export_log)
+        files.addWidget(set_default)
         files.addStretch()
         panel_layout.addLayout(files)
         warning = QLabel("Playback sends real input to your desktop and can move the cursor. Stop it before interacting normally. Only record actions in apps/games where automation is permitted.")
@@ -786,6 +831,7 @@ class MainWindow(QMainWindow):
             if self.playback_worker and self.playback_worker.isRunning():
                 QMessageBox.information(self, "Playback running", "Stop playback before recording a macro.")
                 return
+            self.playback_profile_name = "New recording"
             self.recorder.start()
             self.record_button.setText(f"● RECORDING — click to stop  [{self._hotkeys['record']}]")
             self.record_button.setObjectName("ActiveButton")
@@ -806,6 +852,8 @@ class MainWindow(QMainWindow):
     def start_playback(self):
         if self.playback_worker and self.playback_worker.isRunning():
             return
+        if self.countdown_timer and self.countdown_timer.isActive():
+            return
         if self.recorder.recording:
             QMessageBox.information(self, "Recording", "Stop recording before replaying.")
             return
@@ -815,23 +863,101 @@ class MainWindow(QMainWindow):
         if not self.recorded_events:
             QMessageBox.information(self, "No recording", "Record a sequence or load a recording first.")
             return
+        self.play_button.setEnabled(False)
+        self.pause_playback_button.setEnabled(False)
+        self.stop_playback_button.setEnabled(True)
+        self._show_playback_countdown(3)
+        self.status.setText(f"● {self.playback_profile_name} starts in 3…")
+
+    def _show_playback_countdown(self, seconds=3):
+        self.countdown_remaining = seconds
+        if self.countdown_dialog is None:
+            self.countdown_dialog = QDialog(self)
+            self.countdown_dialog.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+            self.countdown_dialog.setFixedSize(170, 76)
+            self.countdown_dialog.setWindowTitle(self.playback_profile_name)
+            box = QVBoxLayout(self.countdown_dialog)
+            box.setContentsMargins(8, 5, 8, 5)
+            self.countdown_label = QLabel()
+            self.countdown_label.setAlignment(Qt.AlignCenter)
+            self.countdown_label.setStyleSheet("font-size: 22pt; font-weight: bold;")
+            box.addWidget(self.countdown_label)
+            self.countdown_dialog.setStyleSheet("QDialog { background:#202630; color:white; border:1px solid #4c5668; border-radius:7px; } QLabel { color:white; }")
+        self.countdown_dialog.setWindowTitle(self.playback_profile_name)
+        self.countdown_label.setText(str(seconds))
+        self.countdown_dialog.show()
+        self.countdown_dialog.raise_()
+        self.countdown_timer = QTimer(self)
+        self.countdown_timer.setInterval(1000)
+        self.countdown_timer.timeout.connect(self._countdown_tick)
+        self.countdown_timer.start()
+
+    def _countdown_tick(self):
+        self.countdown_remaining -= 1
+        if self.countdown_remaining <= 0:
+            self.countdown_timer.stop()
+            if self.countdown_dialog:
+                self.countdown_dialog.setWindowTitle(self.playback_profile_name)
+                self.countdown_label.setText("▶")
+            self._begin_playback()
+        else:
+            self.countdown_label.setText(str(self.countdown_remaining))
+
+    def _begin_playback(self):
         label = self.play_repeat.currentText()
         repeats = 0 if label == "Infinite" else int(label.split()[0])
         self.playback_worker = PlaybackWorker(self.recorded_events, repeats, self._speed_value(), self.jitter_spin.value(), self.move_cursor_check.isChecked())
         self.playback_worker.message.connect(lambda msg: self.status.setText("● " + msg))
         self.playback_worker.finished.connect(self._playback_finished)
+        self.pause_playback_button.setEnabled(True)
+        self.pause_playback_button.setText("Ⅱ Pause")
         self.play_button.setEnabled(False)
         self.play_button.setProperty("running", True)
         self.play_button.setObjectName("ActiveButton")
         self.play_button.setText(f"● PLAYBACK RUNNING  [{self._hotkeys['play_start']}]")
         self.play_button.style().unpolish(self.play_button); self.play_button.style().polish(self.play_button)
         self.stop_playback_button.setEnabled(True)
-        self.status.setText("● Macro playback running")
+        self.status.setText(f"● Playing: {self.playback_profile_name}")
+        if self.countdown_dialog:
+            self.countdown_dialog.setWindowTitle(self.playback_profile_name)
+            self.countdown_label.setText("▶")
+            self.countdown_dialog.show()
+            self.countdown_dialog.raise_()
         self.playback_worker.start()
 
+    def pause_resume_playback(self):
+        if not self.playback_worker or not self.playback_worker.isRunning():
+            return
+        if self.playback_worker.is_paused:
+            self.playback_worker.resume()
+            self.pause_playback_button.setText("Ⅱ Pause")
+            self.status.setText(f"● Playing: {self.playback_profile_name}")
+            if self.countdown_dialog:
+                self.countdown_dialog.setWindowTitle(self.playback_profile_name)
+                self.countdown_label.setText("▶")
+        else:
+            self.playback_worker.pause()
+            self.pause_playback_button.setText("▶ Resume")
+            self.status.setText(f"● Paused: {self.playback_profile_name}")
+            if self.countdown_dialog:
+                self.countdown_dialog.setWindowTitle(f"Paused — {self.playback_profile_name}")
+                self.countdown_label.setText("Ⅱ")
+                self.countdown_dialog.show()
+                self.countdown_dialog.raise_()
+
     def stop_playback(self):
+        if self.countdown_timer and self.countdown_timer.isActive():
+            self.countdown_timer.stop()
+            if self.countdown_dialog:
+                self.countdown_dialog.hide()
+            self.play_button.setEnabled(True)
+            self.pause_playback_button.setEnabled(False)
+            self.stop_playback_button.setEnabled(False)
+            self.status.setText("● Playback countdown cancelled")
         if self.playback_worker and self.playback_worker.isRunning():
             self.playback_worker.stop()
+            if self.countdown_dialog:
+                self.countdown_dialog.hide()
             self.status.setText("● Stopping playback…")
 
     def _playback_finished(self):
@@ -840,8 +966,58 @@ class MainWindow(QMainWindow):
         self.play_button.setObjectName("StartButton")
         self.play_button.setText(f"▶ Start playback  [{self._hotkeys['play_start']}]")
         self.play_button.style().unpolish(self.play_button); self.play_button.style().polish(self.play_button)
+        self.pause_playback_button.setEnabled(False)
+        self.pause_playback_button.setText("Ⅱ Pause")
         self.stop_playback_button.setEnabled(False)
+        if self.countdown_dialog:
+            self.countdown_dialog.hide()
         self.playback_worker = None
+
+    def set_default_playback_profile(self):
+        if not self.recorded_events:
+            QMessageBox.information(self, "No recording", "Load or record a playback profile first.")
+            return
+        try:
+            DEFAULT_PLAYBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            data = self._playback_profile_data()
+            data["name"] = self.playback_profile_name
+            DEFAULT_PLAYBACK_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.status.setText(f"● Default playback profile set: {self.playback_profile_name}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Default profile failed", str(exc))
+
+    def _load_default_playback_profile(self):
+        if not DEFAULT_PLAYBACK_FILE.exists():
+            return
+        try:
+            self._apply_playback_profile(json.loads(DEFAULT_PLAYBACK_FILE.read_text(encoding="utf-8")))
+            self.status.setText(f"● Default profile loaded: {self.playback_profile_name}")
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            self.status.setText(f"● Could not load default profile: {exc}")
+
+    def _apply_playback_profile(self, data):
+        events = data.get("events") if isinstance(data, dict) else None
+        if not isinstance(events, list) or any(not isinstance(event, dict) or "type" not in event for event in events):
+            raise ValueError("This file is not a valid LiteClick playback profile or recording.")
+        for event in events:
+            float(event.get("t", 0))
+        self.recorded_events = sorted(events, key=lambda item: float(item.get("t", 0)))
+        self.playback_profile_name = str(data.get("name") or "Loaded playback profile")
+        playback = data.get("playback", {})
+        if isinstance(playback, dict):
+            repeat = playback.get("repeat")
+            if repeat in [self.play_repeat.itemText(i) for i in range(self.play_repeat.count())]:
+                self.play_repeat.setCurrentText(repeat)
+            speed = playback.get("speed")
+            if speed in [self.play_speed.itemText(i) for i in range(self.play_speed.count())]:
+                self.play_speed.setCurrentText(speed)
+            variation = playback.get("timing_variation_percent")
+            if isinstance(variation, (int, float)):
+                self.jitter_spin.setValue(max(self.jitter_spin.minimum(), min(self.jitter_spin.maximum(), int(variation))))
+            cursor = playback.get("replay_cursor_movement")
+            if isinstance(cursor, bool):
+                self.move_cursor_check.setChecked(cursor)
+        self.record_count.setText(f"Recorded events: {len(self.recorded_events)}")
 
     def _playback_profile_data(self):
         """Build a portable, replayable profile containing events and playback settings."""
@@ -876,6 +1052,7 @@ class MainWindow(QMainWindow):
             target.parent.mkdir(parents=True, exist_ok=True)
             profile_data = self._playback_profile_data()
             profile_data["name"] = target.stem
+            self.playback_profile_name = target.stem
             target.write_text(json.dumps(profile_data, indent=2, ensure_ascii=False), encoding="utf-8")
             self.status.setText(f"● Playback profile saved: {target.stem}")
         except OSError as exc:
@@ -943,30 +1120,11 @@ class MainWindow(QMainWindow):
             return
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
-            events = data.get("events") if isinstance(data, dict) else None
-            if not isinstance(events, list) or any(not isinstance(event, dict) or "type" not in event for event in events):
-                raise ValueError("This file is not a valid LiteClick playback profile or recording.")
-            # Basic validation prevents malformed timestamps from breaking sorting/playback.
-            for event in events:
-                float(event.get("t", 0))
-            self.recorded_events = sorted(events, key=lambda item: float(item.get("t", 0)))
-            playback = data.get("playback", {}) if isinstance(data, dict) else {}
-            if isinstance(playback, dict):
-                repeat = playback.get("repeat")
-                if repeat in [self.play_repeat.itemText(i) for i in range(self.play_repeat.count())]:
-                    self.play_repeat.setCurrentText(repeat)
-                speed = playback.get("speed")
-                if speed in [self.play_speed.itemText(i) for i in range(self.play_speed.count())]:
-                    self.play_speed.setCurrentText(speed)
-                variation = playback.get("timing_variation_percent")
-                if isinstance(variation, (int, float)):
-                    self.jitter_spin.setValue(max(self.jitter_spin.minimum(), min(self.jitter_spin.maximum(), int(variation))))
-                cursor = playback.get("replay_cursor_movement")
-                if isinstance(cursor, bool):
-                    self.move_cursor_check.setChecked(cursor)
-            self.record_count.setText(f"Recorded events: {len(self.recorded_events)}")
-            self.status.setText("● Playback profile loaded")
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            if isinstance(data, dict) and not data.get("name"):
+                data["name"] = Path(path).stem
+            self._apply_playback_profile(data)
+            self.status.setText(f"● Playback profile loaded: {self.playback_profile_name}")
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             QMessageBox.critical(self, "Load failed", str(exc))
 
     @staticmethod
@@ -1216,6 +1374,10 @@ class MainWindow(QMainWindow):
         self.status.setText("● Emergency stop requested")
 
     def closeEvent(self, event):
+        if self.countdown_timer and self.countdown_timer.isActive():
+            self.countdown_timer.stop()
+        if self.countdown_dialog:
+            self.countdown_dialog.hide()
         if self.recorder.recording:
             self.recorded_events = self.recorder.stop()
         if self.worker and self.worker.isRunning():

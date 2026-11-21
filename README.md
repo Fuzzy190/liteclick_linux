@@ -1,4 +1,4 @@
-# LiteClick — Linux Auto Clicker & Key Presser
+# LiteClick v7.5 — Linux Auto Clicker & Key Presser
 
 LiteClick is a PySide6 desktop utility for repeating multiple keyboard/mouse inputs and recording/replaying desktop macros. The recommended target is Linux Lite on an X11 session.
 
@@ -21,7 +21,7 @@ Check the current desktop session with `echo "$XDG_SESSION_TYPE"`; for this app,
 - Separate Keyboard and Mouse tabs, with multiple inputs and per-input delays.
 - Capture a keyboard key by clicking **Capture key…** and pressing the desired key.
 - Left, middle, and right mouse clicks.
-- Enable/disable individual rows, reorder by removing/re-adding, and save/load named JSON input profiles.
+- Enable/disable individual rows, reorder by removing/re-adding, and save/load named JSON keyboard profiles (mouse profile save/load is intentionally omitted).
 - Infinite or finite automation cycles.
 - Edit per-row delays directly using the delay spinbox; use Move up / Move down to reorder inputs.
 - Customizable global hotkeys, saved between launches. Defaults: F6 toggles keyboard automation, F8 toggles mouse automation, Ctrl+1 starts/stops recording, Ctrl+2 starts playback, Ctrl+3 stops playback, and Ctrl+0 is the emergency stop for all activities.
@@ -59,3 +59,12 @@ The repository includes `build_appimage.sh`, `packaging/liteclick.desktop`, and 
 - Use **Rename saved profile…** in the Playback tab, choose a saved JSON profile, and enter a new display name. LiteClick updates both the profile name inside the JSON and its filename; existing events and playback settings are preserved.
 - Use **Export event log (.md/.txt)…** to export a human-readable event timeline in Markdown or plain text. These exports are reports for reading/sharing and cannot be loaded for playback; use JSON for replay.
 - The default profile folder is `~/.config/liteclick/profiles/`.
+
+
+## v7.5 restoration and improvements
+
+This iteration is based on the fuller v6 source. It preserves keyboard key capture, per-key delays, keyboard profile save/load, mouse and keyboard automation, customizable global hotkeys, playback profile save/load/rename, event-log export, playback speed, timing variation, and cursor movement. Mouse profile save/load controls are intentionally not shown; keyboard profile save/load remains available.
+
+Playback now supports pause/resume without losing its current event position, a compact always-on-top countdown overlay that uses the loaded playback profile name as its window title, cancellation/closure on Stop and Emergency Stop, and a saved default playback profile that is automatically loaded on launch.
+
+Timing variation randomly adjusts each recorded delay by up to the configured percentage (0% keeps the original delay).
